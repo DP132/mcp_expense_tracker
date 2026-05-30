@@ -967,9 +967,15 @@ def _run_tool(name: str, arguments: dict, user_id: int, db) -> dict:  # noqa: C9
             GroupMember.is_active == True,
         ).all()
 
+        member_uids = [m.user_id for m in members]
+        users_q = db.query(User).filter(User.id.in_(member_uids)).all()
+        uid_to_name = {u.id: (u.nickname or u.name) for u in users_q}
+
         member_balances = [
             {
                 "user_id":     m.user_id,
+                "user_name":   uid_to_name.get(m.user_id, f"User {m.user_id}"),
+                "role":        m.role.value,
                 "total_paid":  round(paid_by_map.get(m.user_id, 0), 2),
                 "total_share": round(share_map.get(m.user_id, 0), 2),
                 "net_balance": round(net_balances.get(m.user_id, 0), 2),

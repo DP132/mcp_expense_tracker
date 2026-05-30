@@ -909,8 +909,10 @@ from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 from fastapi import FastAPI, Depends, HTTPException, Request, Form
 from sqlalchemy.orm import Session
 from sqlalchemy import extract
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from datetime import date
+from db import JoinRequestStatus
+
 
 from db import (
     Expense, User, OAuthClient, AuthCode, AccessToken,
@@ -934,24 +936,18 @@ log = logging.getLogger("expense-mcp")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_join_request_model():
-    """Return GroupJoinRequest model, raising ImportError with a helpful message if missing."""
     try:
-        from db import GroupJoinRequest
-        return GroupJoinRequest
+        from db import JoinRequest
+        return JoinRequest
     except ImportError:
-        raise RuntimeError(
-            "GroupJoinRequest model not found in db.py — please add it and run init_db()."
-        )
+        raise RuntimeError("JoinRequest model not found in db.py")
 
 def _get_audit_log_model():
-    """Return GroupAuditLog model, raising ImportError with a helpful message if missing."""
     try:
-        from db import GroupAuditLog
-        return GroupAuditLog
+        from db import AuditLog
+        return AuditLog
     except ImportError:
-        raise RuntimeError(
-            "GroupAuditLog model not found in db.py — please add it and run init_db()."
-        )
+        raise RuntimeError("AuditLog model not found in db.py")
 
 # ─── Password Hashing ─────────────────────────────────────────────────────────
 
@@ -1312,16 +1308,35 @@ class DebtEdge(BaseModel):
 
 # ── V3 schemas ────────────────────────────────────────────────────────────────
 
+# AFTER (clean version)
 class JoinRequestOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     id: int
     group_id: int
     user_id: int
     status: str
     requested_at: datetime
-    resolved_at: Optional[datetime]
-    resolved_by: Optional[int]
-    note: Optional[str]
+    resolved_at: Optional[datetime] = None
+    resolved_by: Optional[int] = None
+    note: Optional[str] = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def remap_fields(cls, data):
+        if hasattr(data, '__dict__'):
+            # SQLAlchemy ORM object — remap column names
+            d = {
+                'id':           data.id,
+                'group_id':     data.group_id,
+                'user_id':      data.user_id,
+                'status':       data.status,
+                'requested_at': data.requested_at,
+                'resolved_at':  getattr(data, 'approved_at', None),
+                'resolved_by':  getattr(data, 'approved_by', None),
+                'note':         None,
+            }
+            return d
+        return data
 
 
 class AuditLogOut(BaseModel):
@@ -1542,15 +1557,14 @@ def _write_audit(
     target_user_id: Optional[int] = None,
     detail: Optional[str] = None,
 ):
-    """Write a GroupAuditLog entry. Silently skips if model is not yet in db.py."""
     try:
         GroupAuditLog = _get_audit_log_model()
         entry = GroupAuditLog(
             group_id=group_id,
-            actor_user_id=actor_user_id,
-            action=action,
-            target_user_id=target_user_id,
-            detail=detail,
+            performed_by=actor_user_id,
+            action_type=action,
+            target_user=target_user_id,
+            metadata_json=detail,
         )
         db.add(entry)
         log.debug(
@@ -1558,7 +1572,6 @@ def _write_audit(
             f"target={target_user_id} detail={detail!r}"
         )
     except RuntimeError:
-        # Model not yet migrated; skip audit without crashing
         log.warning(
             f"[Audit] GroupAuditLog model unavailable — skipping audit for action={action}"
         )
@@ -2356,16 +2369,22 @@ def _dispatch_tool(name: str, arguments: dict, user_id: int, db: Session) -> dic
         # V3: invite code present?
         invite_code_present = bool(getattr(group, "invite_code", None))
 
+        member_user_ids = [m.user_id for m in members]
+        users = db.query(User).filter(User.id.in_(member_user_ids)).all()
+        user_name_map = {u.id: (u.nickname or u.name) for u in users}
+
         member_balances = [
             {
                 "user_id":     m.user_id,
+                "user_name":   user_name_map.get(m.user_id, f"User {m.user_id}"),
+                "role":        m.role.value,
                 "total_paid":  round(paid_by_map.get(m.user_id, 0), 2),
                 "total_share": round(share_map.get(m.user_id, 0), 2),
                 "net_balance": round(net_balances.get(m.user_id, 0), 2),
             }
             for m in members
         ]
-
+    
         return {
             "group_id":              group.id,
             "group_name":            group.name,
@@ -2644,9 +2663,9 @@ def _dispatch_tool(name: str, arguments: dict, user_id: int, db: Session) -> dic
         if jr.status != "pending":
             return {"error": f"Join request is already {jr.status}"}
 
-        jr.status      = "approved"
-        jr.resolved_at = datetime.utcnow()
-        jr.resolved_by = user_id
+        jr.status      = JoinRequestStatus.approved
+        jr.approved_at = datetime.utcnow()
+        jr.approved_by = user_id
 
         # create or re-activate membership
         existing = db.query(GroupMember).filter(
@@ -2694,11 +2713,9 @@ def _dispatch_tool(name: str, arguments: dict, user_id: int, db: Session) -> dic
         if jr.status != "pending":
             return {"error": f"Join request is already {jr.status}"}
 
-        jr.status      = "rejected"
-        jr.resolved_at = datetime.utcnow()
-        jr.resolved_by = user_id
-        if note and hasattr(jr, "note"):
-            jr.note = note
+        jr.status      = JoinRequestStatus.rejected
+        jr.approved_at = datetime.utcnow()   # reusing approved_at as "resolved_at"
+        jr.approved_by = user_id
 
         _write_audit(db, group_id, user_id, "join_rejected", target_user_id=jr.user_id, detail=note)
         try:
@@ -2948,6 +2965,9 @@ def _dispatch_tool(name: str, arguments: dict, user_id: int, db: Session) -> dic
     return {"error": f"Unknown tool: {name}"}
 
 
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SERIALIZATION HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2986,14 +3006,14 @@ def _group_expense_dict(e, shares: list = None) -> dict:
 
 def _join_request_dict(jr) -> dict:
     return {
-        "id":          jr.id,
-        "group_id":    jr.group_id,
-        "user_id":     jr.user_id,
-        "status":      jr.status,
+        "id":           jr.id,
+        "group_id":     jr.group_id,
+        "user_id":      jr.user_id,
+        "status":       jr.status,
         "requested_at": jr.requested_at.isoformat() if jr.requested_at else None,
-        "resolved_at":  jr.resolved_at.isoformat() if getattr(jr, "resolved_at", None) else None,
-        "resolved_by":  getattr(jr, "resolved_by", None),
-        "note":         getattr(jr, "note", None),
+        "resolved_at":  jr.approved_at.isoformat() if jr.approved_at else None,
+        "resolved_by":  jr.approved_by,
+        "note":         None,  # column doesn't exist in db.py
     }
 
 def _audit_log_dict(entry) -> dict:
@@ -4021,11 +4041,9 @@ def reject_join_request_rest(
     if jr.status != "pending":
         raise HTTPException(status_code=400, detail=f"Join request is already {jr.status}")
 
-    jr.status      = "rejected"
-    jr.resolved_at = datetime.utcnow()
-    jr.resolved_by = caller_id
-    if note and hasattr(jr, "note"):
-        jr.note = note
+    jjr.status      = JoinRequestStatus.rejected   # or JoinRequestStatus.rejected
+    jr.approved_at = datetime.utcnow()
+    jr.approved_by = caller_id
 
     _write_audit(db, group_id, caller_id, "join_rejected", target_user_id=jr.user_id, detail=note)
     try:

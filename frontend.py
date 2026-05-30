@@ -1337,6 +1337,17 @@ def _admin_tabs(group_id: int, active: str) -> str:
     return f'<div class="admin-tabs">{items}</div>'
 
 
+async def _get_user_names(token: str, user_ids: list[int]) -> dict[int, str]:
+    """Returns {user_id: display_name} for a list of user IDs."""
+    names = {}
+    for uid in user_ids:
+        profile = await _mcp(token, "get_profile", {}) or {}
+        # get_profile only returns the caller's profile, so use REST /users/{id} if available
+        # For now, batch via group summary data which already has names
+        names[uid] = f"User {uid}"
+    return names
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 def mount_frontend(app):
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2077,10 +2088,10 @@ def mount_frontend(app):
         uname   = profile.get("nickname") or profile.get("name") or "User"
 
         # Validate code and fetch preview
-        result = await _mcp(token, "get_group_by_code", {"invite_code": code.upper()})
+        sc, result = await _rest(token, "GET", f"/groups/join/{code.upper()}")
 
-        if not result or "error" in result:
-            err = (result or {}).get("error", "Invalid or expired invite code.")
+        if sc == 404 or not result or "error" in (result or {}):
+            err = (result or {}).get("detail", "Invalid or expired invite code.")
             return _page("Join Group", f"""
 {_navbar(uname)}
 <div class="page-content" style="max-width:520px">
@@ -2196,18 +2207,26 @@ def mount_frontend(app):
             pending_count = len(reqs) if isinstance(reqs, list) else 0
             if pending_count:
                 req_badge = f' <span style="background:#ef4444;color:#fff;border-radius:20px;font-size:0.65rem;padding:1px 6px;font-weight:600">{pending_count}</span>'
+                
+        user_name_map = {
+            mb['user_id']: mb.get('user_name', f"User {mb['user_id']}")
+            for mb in summary.get('member_balances', [])
+        }
 
         # Member balance table
         bal_rows = ""
         for mb in summary.get("member_balances", []):
+            name     = mb.get('user_name', f"User {mb['user_id']}")
+            initials = "".join(w[0].upper() for w in name.split()[:2])
+            role_b   = _role_badge(mb.get('role', 'member'))
             bal_rows += f"""
             <tr>
               <td>
                 <div style="width:28px;height:28px;border-radius:50%;background:var(--accent-soft);
                             color:var(--accent);font-size:0.75rem;font-weight:600;
                             display:inline-flex;align-items:center;justify-content:center;
-                            margin-right:8px">U</div>
-                User {mb['user_id']}
+                            margin-right:8px">{initials}</div>
+                {name} {role_b}
               </td>
               <td style="font-family:'DM Mono',monospace">₹{mb['total_paid']:,.2f}</td>
               <td style="font-family:'DM Mono',monospace">₹{mb['total_share']:,.2f}</td>
@@ -2222,7 +2241,7 @@ def mount_frontend(app):
               <td style="font-size:0.82rem;font-weight:500">{e.get('title','')}</td>
               <td><span class="badge-cat">{e.get('category','')}</span></td>
               <td style="font-family:'DM Mono',monospace;font-weight:500">₹{e['amount']:,.2f}</td>
-              <td style="font-size:0.82rem;color:var(--muted)">User {e.get('paid_by','')}</td>
+              <td style="font-size:0.82rem;color:var(--muted)">{user_name_map.get(e.get('paid_by'), f"User {e.get('paid_by','')}")}</td>
               <td><span class="badge-type">{e.get('split_type','')}</span></td>
               <td style="font-size:0.82rem;color:var(--muted)">{e.get('date','')}</td>
             </tr>"""
@@ -2545,6 +2564,12 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
         if "error" in summary:
             return RedirectResponse("/app/groups", status_code=302)
 
+        user_name_map = {
+            mb['user_id']: mb.get('user_name', f"User {mb['user_id']}")
+            for mb in summary.get('member_balances', [])
+        }
+
+
         args = {"group_id": group_id}
         if category: args["category"] = category
         if paid_by:  args["paid_by"]  = int(paid_by)
@@ -2566,7 +2591,7 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
               <td style="font-weight:500;font-size:0.875rem">{e.get('title','')}</td>
               <td><span class="badge-cat">{e.get('category','')}</span></td>
               <td style="font-family:'DM Mono',monospace;font-weight:500">₹{e['amount']:,.2f}</td>
-              <td style="font-size:0.82rem;color:var(--muted)">User {e.get('paid_by','')}</td>
+              <td style="font-size:0.82rem;color:var(--muted)">{user_name_map.get(e.get('paid_by'), f"User {e.get('paid_by','')}")}</td>
               <td><span class="badge-type">{e.get('split_type','')}</span></td>
               <td style="font-size:0.82rem;color:var(--muted)">{e.get('date','')}</td>
               <td>{settled}</td>
@@ -2634,6 +2659,11 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
         summary  = await _mcp(token, "get_group_summary", {"group_id": group_id}) or {}
         if "error" in summary:
             return RedirectResponse("/app/groups", status_code=302)
+        user_name_map = {
+            mb['user_id']: mb.get('user_name', f"User {mb['user_id']}")
+            for mb in summary.get('member_balances', [])
+        }
+
 
         sc, settlements = await _rest(token, "GET", f"/groups/{group_id}/settlements")
         settlements = settlements if isinstance(settlements, list) else []
@@ -2654,9 +2684,9 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
                 <div class="debt-row">
                   <div class="debt-arrow"><i class="bi bi-arrow-right"></i></div>
                   <div style="flex:1">
-                    <span style="font-weight:500">User {s['from_user_id']}</span>
+                    <span style="font-weight:500">{user_name_map.get(s['from_user_id'], f"User {s['from_user_id']}")}</span>
                     <span class="text-muted mx-2">owes</span>
-                    <span style="font-weight:500">User {s['to_user_id']}</span>
+                    <span style="font-weight:500">{user_name_map.get(s['to_user_id'], f"User {s['to_user_id']}")}</span>
                   </div>
                   <div style="font-family:'DM Mono',monospace;font-weight:600;color:#b91c1c">₹{s['amount']:,.2f}</div>
                   <form method="post" action="/app/groups/{group_id}/settlements/{s['id']}/settle" class="ms-3">
@@ -2674,9 +2704,9 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
                     <i class="bi bi-check-lg"></i>
                   </div>
                   <div style="flex:1">
-                    <span style="font-weight:500">User {s['from_user_id']}</span>
+                    <span style="font-weight:500">{user_name_map.get(s['from_user_id'], f"User {s['from_user_id']}")}</span>
                     <span class="text-muted mx-2">paid</span>
-                    <span style="font-weight:500">User {s['to_user_id']}</span>
+                    <span style="font-weight:500">{user_name_map.get(s['to_user_id'], f"User {s['to_user_id']}")}</span>
                   </div>
                   <div style="font-family:'DM Mono',monospace;color:#15803d">₹{s['amount']:,.2f} <span style="font-size:0.75rem">settled</span></div>
                 </div>"""
@@ -2762,6 +2792,11 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
         if "error" in summary:
             return RedirectResponse("/app/groups", status_code=302)
 
+        user_name_map = {
+            mb['user_id']: mb.get('user_name', f"User {mb['user_id']}")
+            for mb in summary.get('member_balances', [])
+        }
+
         sc, members = await _rest(token, "GET", f"/groups/{group_id}/members")
         members = members if isinstance(members, list) else []
 
@@ -2772,6 +2807,7 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
                 caller_role = (m.get("role") or "member").lower()
                 break
         is_admin_plus = caller_role in ("owner", "admin")
+
 
         alert = ""
         if msg == "added":
@@ -2792,19 +2828,19 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
                     <i class="bi bi-person-dash"></i>
                   </button>
                 </form>"""
+
+            mname    = user_name_map.get(m['user_id'], f"User {m['user_id']}")
+            minitials = "".join(w[0].upper() for w in mname.split()[:2])
             rows += f"""
             <tr>
               <td>
                 <div style="width:28px;height:28px;border-radius:50%;background:var(--accent-soft);
                             color:var(--accent);font-size:0.75rem;font-weight:600;
                             display:inline-flex;align-items:center;justify-content:center;
-                            margin-right:8px">U</div>
-                User {m['user_id']} {"(you)" if m.get("user_id") == uid else ""}
-              </td>
-              <td>{_role_badge(role)}</td>
-              <td style="font-size:0.82rem;color:var(--muted)">{str(m.get('joined_at',''))[:10]}</td>
-              <td>{remove_btn}</td>
-            </tr>"""
+                            margin-right:8px">{minitials}</div>
+                {mname} {"(you)" if m.get("user_id") == uid else ""}
+              </td>"""
+
 
         if not rows:
             rows = '<tr><td colspan="4" class="text-center text-muted py-3">No members.</td></tr>'
@@ -2922,7 +2958,7 @@ document.getElementById('amount').addEventListener('input', updateSumHint);
   </div>
 </div>""")
 
-        invite_data = await _mcp(token, "generate_invite_code", {"group_id": group_id}) or {}
+        invite_data = await _mcp(token, "get_invite_code", {"group_id": group_id}) or {}
         code        = invite_data.get("invite_code", "—")
         regen_at    = invite_data.get("regenerated_at") or invite_data.get("created_at", "")
 
@@ -3139,7 +3175,7 @@ function fillBulk(inputId) {{
         token = _tok(exp_token)
         if not token:
             return RedirectResponse("/app/login", status_code=302)
-        await _mcp(token, "approve_join_request", {"group_id": group_id, "request_id": request_id})
+        await _mcp(token, "approve_join_request", {"group_id": group_id, "join_request_id": request_id})
         return RedirectResponse(f"/app/groups/{group_id}/requests?msg=approved", status_code=302)
 
     @app.post("/app/groups/{group_id}/requests/{request_id}/reject")
@@ -3150,7 +3186,7 @@ function fillBulk(inputId) {{
         token = _tok(exp_token)
         if not token:
             return RedirectResponse("/app/login", status_code=302)
-        await _mcp(token, "reject_join_request", {"group_id": group_id, "request_id": request_id})
+        await _mcp(token, "reject_join_request",  {"group_id": group_id, "join_request_id": request_id})
         return RedirectResponse(f"/app/groups/{group_id}/requests?msg=rejected", status_code=302)
 
     @app.post("/app/groups/{group_id}/requests/bulk-approve")
@@ -3162,7 +3198,7 @@ function fillBulk(inputId) {{
         if not token:
             return RedirectResponse("/app/login", status_code=302)
         for rid in [x.strip() for x in ids.split(",") if x.strip().isdigit()]:
-            await _mcp(token, "approve_join_request", {"group_id": group_id, "request_id": int(rid)})
+            await _mcp(token, "approve_join_request", {"group_id": group_id, "join_request_id": int(rid)})
         return RedirectResponse(f"/app/groups/{group_id}/requests?msg=bulk_done", status_code=302)
 
     @app.post("/app/groups/{group_id}/requests/bulk-reject")
@@ -3174,7 +3210,7 @@ function fillBulk(inputId) {{
         if not token:
             return RedirectResponse("/app/login", status_code=302)
         for rid in [x.strip() for x in ids.split(",") if x.strip().isdigit()]:
-            await _mcp(token, "reject_join_request", {"group_id": group_id, "request_id": int(rid)})
+            await _mcp(token, "reject_join_request",  {"group_id": group_id, "join_request_id": int(rid)})
         return RedirectResponse(f"/app/groups/{group_id}/requests?msg=bulk_done", status_code=302)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -3329,7 +3365,7 @@ function fillBulk(inputId) {{
         token = _tok(exp_token)
         if not token:
             return RedirectResponse("/app/login", status_code=302)
-        await _mcp(token, "promote_member_to_admin", {"group_id": group_id, "user_id": user_id})
+        await _mcp(token, "change_member_role",   {"group_id": group_id, "user_id": user_id, "new_role": "admin"})
         return RedirectResponse(f"/app/groups/{group_id}/roles?msg=promoted", status_code=302)
 
     @app.post("/app/groups/{group_id}/roles/{user_id}/demote")
@@ -3340,7 +3376,7 @@ function fillBulk(inputId) {{
         token = _tok(exp_token)
         if not token:
             return RedirectResponse("/app/login", status_code=302)
-        await _mcp(token, "demote_admin_to_member", {"group_id": group_id, "user_id": user_id})
+        await _mcp(token, "change_member_role",   {"group_id": group_id, "user_id": user_id, "new_role": "member"})
         return RedirectResponse(f"/app/groups/{group_id}/roles?msg=demoted", status_code=302)
 
     @app.post("/app/groups/{group_id}/roles/{user_id}/transfer")
@@ -3351,7 +3387,7 @@ function fillBulk(inputId) {{
         token = _tok(exp_token)
         if not token:
             return RedirectResponse("/app/login", status_code=302)
-        await _mcp(token, "transfer_group_ownership", {"group_id": group_id, "new_owner_user_id": user_id})
+        await _mcp(token, "transfer_ownership",   {"group_id": group_id, "new_owner_user_id": user_id})
         return RedirectResponse(f"/app/groups/{group_id}/roles?msg=transferred", status_code=302)
 
     # ══════════════════════════════════════════════════════════════════════════

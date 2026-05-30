@@ -138,22 +138,22 @@ class JoinRequestStatus(str, enum.Enum):
 
 
 class AuditActionType(str, enum.Enum):
-    # invite code
+    join_requested        = "join_requested"
+    join_approved         = "join_approved"
+    join_rejected         = "join_rejected"
+    member_promoted       = "member_promoted"
+    member_demoted        = "member_demoted"
+    ownership_transferred = "ownership_transferred"
+    member_removed        = "member_removed"
+    member_added          = "member_added"          # ADD if missing
+    member_reactivated    = "member_reactivated"    # ADD if missing
+    member_deactivated    = "member_deactivated"    # ADD if missing
+    group_created         = "group_created"
+    group_archived        = "group_archived"
+    group_unarchived      = "group_unarchived"      # ADD if missing
+    group_deleted         = "group_deleted"
     invite_code_generated   = "invite_code_generated"
     invite_code_regenerated = "invite_code_regenerated"
-    # join requests
-    join_requested          = "join_requested"
-    join_approved           = "join_approved"
-    join_rejected           = "join_rejected"
-    # role / membership
-    member_promoted         = "member_promoted"        # member → admin
-    member_demoted          = "member_demoted"         # admin  → member
-    ownership_transferred   = "ownership_transferred"
-    member_removed          = "member_removed"
-    # group lifecycle
-    group_created           = "group_created"
-    group_archived          = "group_archived"
-    group_deleted           = "group_deleted"
 
 
 # ─────────────────────────────────────────────
